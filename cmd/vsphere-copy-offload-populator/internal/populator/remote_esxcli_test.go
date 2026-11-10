@@ -10,6 +10,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/vmware/govmomi/cli/esx"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/vim25/types"
 	"go.uber.org/mock/gomock"
 
 	"github.com/kubev2v/forklift/cmd/vsphere-copy-offload-populator/internal/version"
@@ -390,6 +391,137 @@ var _ = Describe("validateVibVersion", func() {
 
 			_, err := validateVibVersion(context.Background(), mockClient, host)
 			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+})
+
+// stubHostLocker is a Hostlocker test double that records the locked host and
+// optionally fails without running the critical section.
+type stubHostLocker struct {
+	capturedHostID string
+	lockErr        error
+	ran            bool
+}
+
+func (s *stubHostLocker) WithLock(ctx context.Context, hostID string, work func(context.Context) error) error {
+	s.capturedHostID = hostID
+	if s.lockErr != nil {
+		return s.lockErr
+	}
+	s.ran = true
+	return work(ctx)
+}
+
+// stubStorageApi is a StorageApi test double that only implements the
+// mapping behavior needed by mapAndRescan tests.
+type stubStorageApi struct {
+	mapTargetErr error
+	mappedLun    LUN
+	mapCalls     int
+}
+
+func (s *stubStorageApi) EnsureClonnerIgroup(initiatorGroup string, clonnerIqn []string) (MappingContext, error) {
+	return MappingContext{}, nil
+}
+
+func (s *stubStorageApi) MapTarget(targetLUN LUN, context MappingContext) (LUN, error) {
+	s.mapCalls++
+	if s.mapTargetErr != nil {
+		return LUN{}, s.mapTargetErr
+	}
+	return s.mappedLun, nil
+}
+
+func (s *stubStorageApi) UnmapTarget(targetLUN LUN, context MappingContext) error { return nil }
+
+func (s *stubStorageApi) Map(initatorGroup string, targetLUN LUN, context MappingContext) (LUN, error) {
+	return targetLUN, nil
+}
+
+func (s *stubStorageApi) UnMap(initatorGroup string, targetLUN LUN, context MappingContext) error {
+	return nil
+}
+
+func (s *stubStorageApi) CurrentMappedGroups(targetLUN LUN, context MappingContext) ([]string, error) {
+	return nil, nil
+}
+
+func (s *stubStorageApi) ResolvePVToLUN(pv PersistentVolume) (LUN, error) {
+	return LUN{}, nil
+}
+
+var _ = Describe("mapAndRescan", func() {
+	var (
+		ctrl       *gomock.Controller
+		mockClient *vmware_mocks.MockClient
+		locker     *stubHostLocker
+		storage    *stubStorageApi
+		host       *object.HostSystem
+		pop        *RemoteEsxcliPopulator
+		inLun      LUN
+		ctx        context.Context
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		mockClient = vmware_mocks.NewMockClient(ctrl)
+		locker = &stubHostLocker{}
+		storage = &stubStorageApi{}
+		host = object.NewHostSystem(nil, types.ManagedObjectReference{Type: "HostSystem", Value: "host-42"})
+		pop = &RemoteEsxcliPopulator{VSphereClient: mockClient, StorageApi: storage}
+		inLun = LUN{Name: "lun-0"}
+		ctx = context.Background()
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+	})
+
+	Context("when the volume maps and the device becomes visible", func() {
+		It("should map and rescan while holding the per-host lease", func() {
+			storage.mappedLun = LUN{Name: "lun-0", NAA: "naa.6006016004602200"}
+			// The rescan must look for the mapped NAA, proving it runs after
+			// the mapping, inside the lease.
+			listCmd := []string{"storage", "core", "device", "list", "-d", storage.mappedLun.NAA}
+			mockClient.EXPECT().RunEsxCommand(gomock.Any(), host, gomock.Eq(listCmd)).
+				Return([]esx.Values{{"Status": {"on"}}}, nil)
+
+			out, err := pop.mapAndRescan(ctx, locker, host, inLun, MappingContext{}, "xcopy-group")
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(storage.mapCalls).To(Equal(1))
+			Expect(out.NAA).To(Equal(storage.mappedLun.NAA))
+			Expect(locker.ran).To(BeTrue())
+			// The lease is keyed on the ESXi host performing the attach.
+			Expect(locker.capturedHostID).To(Equal("hostsystem-host-42"))
+		})
+	})
+
+	Context("when MapTarget fails", func() {
+		It("should return the error and the unresolved LUN for partial cleanup", func() {
+			storage.mapTargetErr = errors.New("Another LDEV is already mapped to LUN")
+
+			out, err := pop.mapAndRescan(ctx, locker, host, inLun, MappingContext{}, "xcopy-group")
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to map lun"))
+			Expect(err.Error()).To(ContainSubstring("Another LDEV is already mapped to LUN"))
+			Expect(storage.mapCalls).To(Equal(1))
+			Expect(out).To(Equal(inLun))
+		})
+	})
+
+	Context("when the host lease cannot be acquired", func() {
+		It("should fail without mapping the LUN", func() {
+			locker.lockErr = errors.New("context canceled while waiting for lock")
+
+			out, err := pop.mapAndRescan(ctx, locker, host, inLun, MappingContext{}, "xcopy-group")
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("context canceled while waiting for lock"))
+			// The mapping must only happen inside the lease.
+			Expect(storage.mapCalls).To(Equal(0))
+			Expect(out).To(Equal(inLun))
 		})
 	})
 })

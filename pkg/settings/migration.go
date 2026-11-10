@@ -65,6 +65,7 @@ const (
 	MaxParentBackingRetries                = "MAX_PARENT_BACKING_RETRIES"
 	HostLeaseNamespace                     = "HOST_LEASE_NAMESPACE"
 	HostLeaseDurationSeconds               = "HOST_LEASE_DURATION_SECONDS"
+	HostLeaseMaxHolders                    = "HOST_LEASE_MAX_HOLDERS"
 	MigrationServiceAccount                = "MIGRATION_SERVICE_ACCOUNT"
 	PVCNameTemplate                        = "PVC_NAME_TEMPLATE"
 	OCPPVCNameTemplate                     = "OCP_PVC_NAME_TEMPLATE"
@@ -172,6 +173,9 @@ type Migration struct {
 	HostLeaseNamespace string
 	// HostLeaseDurationSeconds is the host lease duration in seconds used in copy offload
 	HostLeaseDurationSeconds string
+	// HostLeaseMaxHolders is the maximum number of concurrent host lease holders
+	// (concurrent LUN map+rescan sections per ESXi host) used in copy offload
+	HostLeaseMaxHolders string
 	// ServiceAccount is the cluster-wide default ServiceAccount for migration pods
 	ServiceAccount string
 	// PVCNameTemplate is the cluster-wide default PVC name template for non-OCP providers.
@@ -396,6 +400,7 @@ func (r *Migration) Load() (err error) {
 	// Host lease settings for copy offload
 	r.HostLeaseNamespace = Lookup(HostLeaseNamespace, "openshift-mtv")
 	r.HostLeaseDurationSeconds = Lookup(HostLeaseDurationSeconds, "10")
+	r.HostLeaseMaxHolders = Lookup(HostLeaseMaxHolders, "2")
 	if val, found := os.LookupEnv(MigrationServiceAccount); found {
 		r.ServiceAccount = val
 	}

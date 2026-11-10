@@ -230,25 +230,19 @@ func (p *RemoteEsxcliPopulator) Populate(ctx context.Context, vmId string, migra
 		}
 	}()
 
-	mapLog.Info("mapping volume to initiator group", "initiator_group", xcopyInitiatorGroup, "lun", lun.Name)
-	lun, err = p.StorageApi.MapTarget(lun, mappingContext)
+	// The LUN mapping and the rescan that follows run while holding the
+	// per-host lease: storage arrays cannot always cope with many concurrent
+	// LUN mappings issued for the same host group (e.g. "Another LDEV is
+	// already mapped to LUN"), and concurrent rescans already had to be
+	// serialized to keep the ESX stable. Only the attach phase holds the
+	// lease — the copy itself stays parallel, so MAX_POPULATOR_INFLIGHT is
+	// not reduced. See MTV-7442.
+	lun, err = p.mapAndRescan(ctx, hostLocker, host, lun, mappingContext, xcopyInitiatorGroup)
 	if err != nil {
-		return fmt.Errorf("failed to map lun %s to initiator group %s: %w", lun, xcopyInitiatorGroup, err)
+		return err
 	}
 
 	targetLUN := fmt.Sprintf("/vmfs/devices/disks/%s", lun.NAA)
-	mapLog.Info("volume mapped to initiator group", "initiator_group", xcopyInitiatorGroup, "device", targetLUN)
-
-	leaseHostID := strings.ReplaceAll(strings.ToLower(host.String()), ":", "-")
-	rescanLog.Info("rescanning host for device", "device", lun.NAA)
-	err = hostLocker.WithLock(ctx, leaseHostID,
-		func(lockCtx context.Context) error {
-			return rescan(lockCtx, p.VSphereClient, host, lun.NAA)
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to find the device %s after scanning: %w", targetLUN, err)
-	}
 	rescanLog.Info("device visible on ESXi", "device", targetLUN)
 
 	defer func() {
@@ -340,6 +334,50 @@ func (p *RemoteEsxcliPopulator) Populate(ctx context.Context, vmId string, migra
 	// Use unified task execution (clone context so all clone/SSH logs show under clone)
 	cloneCtx := klog.NewContext(ctx, cloneLog)
 	return ExecuteCloneTask(cloneCtx, executor, host, vmDisk.Datastore, vmDisk.Path(), targetLUN, progress, xcopyUsed)
+}
+
+// mapAndRescan maps the LUN to the clonner initiator group and rescans the ESXi
+// host so the device becomes visible, both while holding the per-host lease.
+// Populators run in parallel (MAX_POPULATOR_INFLIGHT), and storage arrays
+// cannot always cope with many concurrent LUN mappings issued for the same
+// host group — e.g. Hitachi arrays fail with "Another LDEV is already mapped
+// to LUN" when the LUN number auto-assignment races. The lease serializes the
+// attach phase per host, matching the rescan serialization, without reducing
+// the parallelism of the copies themselves. See MTV-7442.
+// On error the input LUN is returned unchanged so partial cleanup can still
+// attempt to unmap it.
+func (p *RemoteEsxcliPopulator) mapAndRescan(
+	ctx context.Context,
+	hostLocker Hostlocker,
+	host *object.HostSystem,
+	lun LUN,
+	mappingContext MappingContext,
+	xcopyInitiatorGroup string,
+) (LUN, error) {
+	log := logger.New("xcopy")
+	mapLog := log.WithName("map-volume")
+	rescanLog := log.WithName("rescan")
+
+	leaseHostID := strings.ReplaceAll(strings.ToLower(host.String()), ":", "-")
+	mapLog.Info("mapping volume to initiator group", "initiator_group", xcopyInitiatorGroup, "lun", lun.Name)
+
+	err := hostLocker.WithLock(ctx, leaseHostID,
+		func(lockCtx context.Context) error {
+			mappedLun, err := p.StorageApi.MapTarget(lun, mappingContext)
+			if err != nil {
+				return fmt.Errorf("failed to map lun %s to initiator group %s: %w", lun.Name, xcopyInitiatorGroup, err)
+			}
+			lun = mappedLun
+			mapLog.Info("volume mapped to initiator group", "initiator_group", xcopyInitiatorGroup, "device", lun.NAA)
+
+			rescanLog.Info("rescanning host for device", "device", lun.NAA)
+			if err := rescan(lockCtx, p.VSphereClient, host, lun.NAA); err != nil {
+				return fmt.Errorf("failed to find the device %s after scanning: %w", lun.NAA, err)
+			}
+			return nil
+		},
+	)
+	return lun, err
 }
 
 // waitForDeviceStateOff waits for the device state to become "off" using exponential backoff

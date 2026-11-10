@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,6 +35,7 @@ type HostLeaseLocker struct {
 	// renewInterval is how often to renew the lease while work is running. Default: 3 seconds
 	renewInterval time.Duration
 	// maxConcurrentHolders is the maximum number of concurrent lease holders per host. Default: 2
+	// Can be configured via HOST_LEASE_MAX_HOLDERS env var
 	maxConcurrentHolders int
 }
 
@@ -55,6 +57,19 @@ func NewHostLeaseLocker(clientset kubernetes.Interface) *HostLeaseLocker {
 	if durationStr := os.Getenv("HOST_LEASE_DURATION_SECONDS"); durationStr != "" {
 		if duration, err := time.ParseDuration(durationStr + "s"); err == nil {
 			h.leaseDuration = duration
+		}
+	}
+
+	// maxConcurrentHolders bounds how many populators can hold the per-host
+	// lease at once — i.e. how many LUN map+rescan sections may run in
+	// parallel on the same ESXi host. It acts as the rate limit for LUN
+	// attaches when many populator pods are in flight (MTV-7442).
+	if holdersStr := os.Getenv("HOST_LEASE_MAX_HOLDERS"); holdersStr != "" {
+		if holders, err := strconv.Atoi(holdersStr); err == nil && holders >= 1 {
+			h.maxConcurrentHolders = holders
+		} else {
+			klog.Warningf("Invalid HOST_LEASE_MAX_HOLDERS value %q, must be an integer >= 1, using default (%d)",
+				holdersStr, h.maxConcurrentHolders)
 		}
 	}
 
